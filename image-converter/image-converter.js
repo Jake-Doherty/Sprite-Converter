@@ -45,7 +45,7 @@ async function convertWithPalette() {
       // 1 or 2 frames; avoid asking for an out-of-range page index.
       const pages = metadata.pages || 1;
       const firstPage = 0;
-      const secondPage = pages > 1 ? 1 : 0; // use page 1 if it exists, else repeat 0
+      const secondPage = pages > 1 ? 1 : 0;
 
       const processFrame = async (idx) => {
         const pageIndex = idx === 0 ? firstPage : secondPage;
@@ -55,7 +55,11 @@ async function convertWithPalette() {
           .raw()
           .toBuffer({ resolveWithObject: true });
 
-        let packed = Buffer.alloc(2048, 0);
+        // 3-bit = 8 colors, need 1.5 bytes per 2 pixels (3 bits × 2 = 6 bits, round up)
+        // For 64×64 = 4096 pixels, we need 4096 × 3 bits = 12288 bits = 1536 bytes
+        let packed = Buffer.alloc(1536, 0);
+        let bitOffset = 0;
+
         for (let i = 0; i < data.length / 4; i++) {
           const r = data[i * 4];
           const g = data[i * 4 + 1];
@@ -70,32 +74,45 @@ async function convertWithPalette() {
           } else {
             const lum = 0.299 * r + 0.587 * g + 0.114 * b;
 
-            // Map luminance so light areas -> low index, dark -> high index
-            colorIndex = 15 - Math.floor(lum / 17);
+            // Map to 3-bit (0-7), but reserve 0 for transparent
+            // Light areas -> low index (1), dark -> high index (7)
+            colorIndex = 7 - Math.floor(lum / 37); // 255 / 7 ≈ 37
             if (colorIndex < 1) colorIndex = 1; // Reserve 0 for transparent
-            if (colorIndex > 15) colorIndex = 15;
+            if (colorIndex > 7) colorIndex = 7;
           }
 
-          const byteIdx = Math.floor(i / 2);
-          if (i % 2 === 0) packed[byteIdx] = colorIndex << 4;
-          else packed[byteIdx] |= colorIndex & 0x0f;
+          // Pack 3-bit values
+          const byteIdx = Math.floor(bitOffset / 8);
+          const bitPos = bitOffset % 8;
+          
+          // Write the 3-bit value at the current bit position
+          if (bitPos <= 5) {
+            // Fits in current byte
+            packed[byteIdx] |= (colorIndex << (5 - bitPos));
+          } else {
+            // Spans two bytes
+            const bitsInFirst = 8 - bitPos;
+            const bitsInSecond = 3 - bitsInFirst;
+            packed[byteIdx] |= (colorIndex >> bitsInSecond);
+            packed[byteIdx + 1] |= (colorIndex << (8 - bitsInSecond));
+          }
+          
+          bitOffset += 3;
         }
-        return Buffer.concat([Buffer.from([64, 64, 4]), packed]);
+        
+        // Header: width (64), height (64), bits per pixel (3)
+        return Buffer.concat([Buffer.from([64, 64, 3]), packed]);
       };
+
       for (let f = 0; f < 2; f++) {
         const frameData = await processFrame(f);
 
-        // Append actual data
         fs.appendFileSync(assetPackFile, frameData);
 
-        // Calculate index position for THIS specific ID and Frame
         const entryPos = (pokemonId * 2 + f) * 8;
-
-        // Write the START offset and actual LENGTH of this block
         indexBuffer.writeUInt32LE(currentOffset, entryPos);
         indexBuffer.writeUInt32LE(frameData.length, entryPos + 4);
 
-        // Increment by the actual appended length to keep offsets valid
         currentOffset += frameData.length;
       }
       console.log(`✓ Indexed ${pokemonId}`);
